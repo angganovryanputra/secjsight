@@ -1,87 +1,82 @@
+import argparse
 import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import re
 import json
-import os
 import yaml
 from urllib.parse import urljoin, urlparse
+import urllib3
+from requests_toolbelt.adapters import SSLAdapter
+import ssl
+
+# Mengabaikan peringatan SSL yang tidak diverifikasi
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def create_session_with_tls():
+    session = requests.Session()
+    session.mount('https://', SSLAdapter(ssl.PROTOCOL_TLSv1_2))  # Paksa penggunaan TLSv1.2
+    session.verify = False
+    return session
 
 def load_vulnerability_rules(filepath="vulnerability_rules.yaml"):
-    """
-    Memuat aturan kerentanan dari file YAML.
-    """
     with open(filepath, "r") as file:
         data = yaml.safe_load(file)
     return data.get("rules", [])
 
 def ensure_protocol(domain_url):
-    """
-    Menambahkan protokol https ke URL jika tidak disertakan.
-    """
     if not domain_url.startswith(('http://', 'https://')):
         domain_url = 'https://' + domain_url
     return domain_url
 
 def is_internal_link(url, base_url):
-    """
-    Mengecek apakah URL adalah tautan internal dari domain utama.
-    """
     return urlparse(url).netloc == urlparse(base_url).netloc
 
+def create_session():
+    session = requests.Session()
+    retry = Retry(total=5, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.verify = False
+    return session
+
+session = create_session()
+
 def fetch_js_files(domain_url, max_depth=2):
-    """
-    Mengambil file-file JavaScript dari halaman web hingga kedalaman yang ditentukan.
-    """
     visited_urls = set()
     js_files = set()
     urls_to_visit = [(domain_url, 0)]
-    parameters_found = {}
-
-    parameter_regex = re.compile(r'[?&]([^=&]+)=([^&]*)')  # Regex untuk mendeteksi parameter
 
     while urls_to_visit:
         current_url, depth = urls_to_visit.pop(0)
-
         if current_url in visited_urls or depth > max_depth:
             continue
 
         try:
-            response = requests.get(current_url)
+            response = session.get(current_url)
             response.raise_for_status()
             visited_urls.add(current_url)
 
-            # Parsing halaman untuk menemukan file JS dan tautan internal
             soup = BeautifulSoup(response.text, 'html.parser')
-
-            # Tambahkan semua file JS ke dalam set js_files
             for script in soup.find_all('script', src=True):
                 src = script['src']
                 js_file_url = urljoin(current_url, src)
-                if js_file_url.startswith(('http://', 'https://')):
+                if js_file_url.startswith(('http://', 'https://')) and is_internal_link(js_file_url, domain_url):
                     js_files.add(js_file_url)
 
-            # Analisis URL untuk parameter query dengan regex
-            matches = parameter_regex.findall(current_url)
-            if matches:
-                parameters_found[current_url] = {param[0]: param[1] for param in matches}
-
-            # Tambahkan tautan internal untuk kedalaman crawling lebih lanjut
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                full_url = urljoin(current_url, href)
-                if is_internal_link(full_url, domain_url) and full_url not in visited_urls:
-                    urls_to_visit.append((full_url, depth + 1))
-
+        except requests.exceptions.SSLError as ssl_err:
+            print(f"SSL error ignored for {current_url}: {ssl_err}")
         except requests.exceptions.RequestException as e:
             print(f"Error fetching {current_url}: {e}")
 
-    return list(js_files), parameters_found
+    return list(js_files)
 
-def extract_endpoints(js_code):
+def extract_endpoints(js_code, js_file_name):
     """
-    Mengekstrak endpoint dari kode JavaScript menggunakan beberapa pola regex.
+    Mengekstrak endpoint dari kode JavaScript dan memberikan informasi
+    baris di mana setiap endpoint ditemukan.
     """
-    # Regex untuk berbagai pola URL
     url_patterns = [
         r'(https?://[^\s\'";]+)',         # URL langsung
         r'["\'](/[^\'"]+)',               # URL relatif
@@ -89,138 +84,108 @@ def extract_endpoints(js_code):
     ]
     
     endpoints = []
-    for pattern in url_patterns:
-        matches = re.findall(pattern, js_code)
-        endpoints.extend(matches)
-
-    # Hapus duplikasi endpoint
-    return list(set(endpoints))
-
-def scan_for_vulnerabilities(js_code, rules):
-    """
-    Memindai kode JavaScript berdasarkan aturan kerentanan.
-    """
-    vulnerabilities = []
     lines = js_code.splitlines()
-
-    for rule in rules:
-        pattern = rule['pattern']
-        for i, line in enumerate(lines, start=1):
-            if pattern in line:
-                vulnerabilities.append({
-                    'type': rule['type'],
-                    'line': i,
-                    'code': line.strip(),
-                    'description': rule['description'],
-                    'reference': rule['reference']
+    for line_number, line in enumerate(lines, start=1):
+        for pattern in url_patterns:
+            matches = re.findall(pattern, line)
+            for match in matches:
+                endpoints.append({
+                    "endpoint": match,
+                    "file": js_file_name,
+                    "line": line_number
                 })
 
-    return vulnerabilities
+    return endpoints
+
+def extract_endpoints_from_js_file(js_files, display_mode):
+    endpoints_report = []
+    
+    for js_file in js_files:
+        try:
+            response = requests.get(js_file, verify=False)
+            response.raise_for_status()
+            js_code = response.text
+            
+            endpoints = extract_endpoints(js_code, js_file)
+            endpoints_report.extend(endpoints)
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching {js_file}: {e}")
+
+    print("\nExtraction Complete. Endpoints extracted from JS file contents:")
+    for endpoint_info in endpoints_report:
+        if display_mode == "endpoint":
+            print(f"Endpoint: {endpoint_info['endpoint']}")
+        elif display_mode == "source":
+            print(f"File: {endpoint_info['file']}")
+        elif display_mode == "full":
+            print(f"File: {endpoint_info['file']}, Line: {endpoint_info['line']}, Endpoint: {endpoint_info['endpoint']}")
+    
+    return endpoints_report
+
+def extract_endpoints_from_crawling(domain_url, max_depth=2):
+    visited_urls = set()
+    endpoints = set()
+    urls_to_visit = [(domain_url, 0)]
+
+    while urls_to_visit:
+        current_url, depth = urls_to_visit.pop(0)
+        if current_url in visited_urls or depth > max_depth:
+            continue
+
+        try:
+            response = session.get(current_url)
+            response.raise_for_status()
+            visited_urls.add(current_url)
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for link in soup.find_all('a', href=True):
+                href = link['href']
+                full_url = urljoin(current_url, href)
+                if is_internal_link(full_url, domain_url):
+                    endpoints.add(full_url)
+                    urls_to_visit.append((full_url, depth + 1))
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching {current_url}: {e}")
+
+    print("\nExtraction Complete. Endpoints from Crawling:")
+    print(json.dumps(list(endpoints), indent=2))
+    return list(endpoints)
 
 def save_report(report, domain_url, report_type="report"):
-    """
-    Menyimpan laporan sebagai file JSON.
-    """
     filename = f"{domain_url.replace('https://', '').replace('http://', '').replace('/', '_')}_{report_type}.json"
     with open(filename, "w") as file:
         json.dump(report, file, indent=2)
     print(f"{report_type.capitalize()} saved as {filename}")
 
-def extract_endpoints_mode(domain_url, max_depth=2):
-    """
-    Mode untuk hanya mengekstrak endpoint dari file JavaScript.
-    """
-    js_files, parameters_found = fetch_js_files(domain_url, max_depth=max_depth)
-    endpoints_report = {
-        'domain': domain_url,
-        'js_files': js_files,
-        'endpoints': {},
-        'parameters': parameters_found
-    }
-    
-    for js_file in js_files:
-        try:
-            response = requests.get(js_file)
-            response.raise_for_status()
-            js_code = response.text
-            
-            endpoints = extract_endpoints(js_code)
-            endpoints_report['endpoints'][js_file] = endpoints
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching {js_file}: {e}")
+def main():
+    parser = argparse.ArgumentParser(description="SecJSight - A tool for JavaScript vulnerability scanning and endpoint extraction.")
+    parser.add_argument("-u", "--url", required=True, help="URL of the application to be scanned.")
+    parser.add_argument("--extract-endpoint-js", action="store_true", help="Extract endpoints from the contents of JavaScript files only.")
+    parser.add_argument("--extract-endpoint-crawl", action="store_true", help="Extract endpoints from web crawling.")
+    parser.add_argument("--display-mode", choices=["endpoint", "source", "full"], default="full", help="Choose display mode for endpoints: 'endpoint', 'source', or 'full'.")
+    parser.add_argument("--max-depth", type=int, default=2, help="Maximum crawling depth (default is 2).")
 
-    print("\nExtraction Complete. Endpoints and parameters found:")
-    print(json.dumps(endpoints_report, indent=2))
+    args = parser.parse_args()
+    domain_url = ensure_protocol(args.url)
+    max_depth = args.max_depth
 
-    save_choice = input("Would you like to save the endpoints report? (yes/no): ").strip().lower()
-    if save_choice == 'yes':
-        save_report(endpoints_report, domain_url, report_type="endpoints")
-
-def vulnerability_scan_mode(domain_url, max_depth=2):
-    """
-    Mode untuk melakukan vulnerability scanning pada file JavaScript dan mencatat parameter.
-    """
-    rules = load_vulnerability_rules()
-    js_files, parameters_found = fetch_js_files(domain_url, max_depth=max_depth)
-    vulnerabilities_report = {
-        'domain': domain_url,
-        'js_files': js_files,
-        'vulnerabilities': {},
-        'parameters': parameters_found
-    }
-    
-    vulnerabilities_found = False
-
-    for js_file in js_files:
-        try:
-            response = requests.get(js_file)
-            response.raise_for_status()
-            js_code = response.text
-            
-            vulnerabilities = scan_for_vulnerabilities(js_code, rules)
-            if vulnerabilities:
-                vulnerabilities_found = True
-                vulnerabilities_report['vulnerabilities'][js_file] = vulnerabilities
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching {js_file}: {e}")
-
-    if vulnerabilities_found or parameters_found:
-        print("\nVulnerability Scanning Complete. Vulnerabilities and parameters that need validation:")
-        print(json.dumps(vulnerabilities_report, indent=2))
-
-        save_choice = input("Would you like to save the vulnerabilities report? (yes/no): ").strip().lower()
+    if args.extract_endpoint_js:
+        js_files = fetch_js_files(domain_url, max_depth)
+        endpoints_report = extract_endpoints_from_js_file(js_files, args.display_mode)
+        save_choice = input("Would you like to save the endpoints report from JS file? (yes/no): ").strip().lower()
         if save_choice == 'yes':
-            save_report(vulnerabilities_report, domain_url, report_type="vulnerabilities")
-    else:
-        print("No vulnerabilities or parameters needing validation found.")
-
-def main_menu():
-    """
-    Menu utama untuk memilih antara mode extract endpoints atau vulnerability scanning.
-    """
-    domain_url = input("Masukkan URL aplikasi yang akan dipindai: ").strip()
-    domain_url = ensure_protocol(domain_url)
+            save_report(endpoints_report, domain_url, report_type="endpoints_js")
     
-    if not re.match(r'^https?://', domain_url):
-        print("URL tidak valid. Harap masukkan URL dengan format yang benar.")
-        return
-
-    max_depth = int(input("Masukkan kedalaman crawling (misal: 1 atau 2): ").strip())
+    if args.extract_endpoint_crawl:
+        endpoints_report = extract_endpoints_from_crawling(domain_url, max_depth)
+        save_choice = input("Would you like to save the endpoints report from crawling? (yes/no): ").strip().lower()
+        if save_choice == 'yes':
+            save_report(endpoints_report, domain_url, report_type="endpoints_crawl")
     
-    print("\nPilih mode operasi:")
-    print("1. Extract Endpoints")
-    print("2. Vulnerability Scanning")
+    if not args.extract_endpoint_js and not args.extract_endpoint_crawl:
+        print("Please specify --extract-endpoint-js or --extract-endpoint-crawl to perform endpoint extraction.")
 
-    choice = input("Masukkan pilihan (1/2): ").strip()
-
-    if choice == "1":
-        extract_endpoints_mode(domain_url, max_depth=max_depth)
-    elif choice == "2":
-        vulnerability_scan_mode(domain_url, max_depth=max_depth)
-    else:
-        print("Pilihan tidak valid. Silakan coba lagi.")
-
-# Menjalankan menu utama
-main_menu()
+if __name__ == "__main__":
+    main()
